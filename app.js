@@ -4,98 +4,104 @@ import multer from 'multer';
 import pdfParse from 'pdf-parse/lib/pdf-parse.js';
 import { readFileSync } from 'fs';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { pipeline } from "@xenova/transformers";
+import faiss from 'faiss-node';
+import { extract_prompt } from './embed.js';
+
+let encoder = null;
+const faissIndex = new faiss.IndexFlatL2(768); 
+const metadata = [];
+
+initializeEncoder();
+
+async function initializeEncoder() {
+    encoder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
+    console.log("Embedding model initialized");
+}
 
 const app = express();
 const PORT = 3000;
 
-// Middleware to parse JSON requests
 app.use(express.json());
 app.use(cors());
 const upload = multer({ dest: 'uploads/' });
 
-
-const apikey = "AIzaSyCgxmn8jRTWvcxCerow2nzexkw_38hlA5o"
+const apikey = "AIzaSyCgxmn8jRTWvcxCerow2nzexkw_38hlA5o";
 const genAI = new GoogleGenerativeAI(apikey);
 const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
 
-// Basic route
-app.get('/', async (req, res) => {
-    const prompt = "difference between python and java";
-    const response = await model.generateContent(prompt);
-    const result = response.response.text();
-    console.log(result)
-    res.send(result);
-
-});
-
-// Start the server
-app.listen(PORT, () => {
-    console.log(`Server is running on http://localhost:${PORT}`);
-});
-
-
-
 
 async function extractTextFromPDF(pdfPath) {
-    
     const dataBuffer = readFileSync(pdfPath);
     const data = await pdfParse(dataBuffer);
-    
-    const text = data.text
-        .replace(/\s+/g, ' ')  
-        .replace(/[\r\n]+/g, '\n') 
-        .trim();
-    
-    console.log('Extracted text:', text.substring(0, 500) + '...');
-    return text;
+    return data.text.replace(/\s+/g, ' ').trim();
 }
 
-async function storeEmbedding(extractedData, fileName) {
+async function storeEmbedding(extractedData, userId) {
     if (!encoder || !faissIndex) {
-        throw new Error('Encoder or FAISS index not initialized');
+        throw new Error("Encoder or FAISS index not initialized");
     }
 
     const text = JSON.stringify(extractedData);
-    const embedding = await encoder.embed([text]);
-    const vector = await embedding.array();
     
-    faissIndex.add(vector[0]);
+    const embedding = await encoder(text, { pooling: "mean", normalize: true });
+    const vector = embedding.data;
+    console.log(vector);
+    // faissIndex.add([vector]);
     const vectorId = faissIndex.ntotal() - 1;
-    metadata.push({
-        fileName,
-        data: extractedData,
-        vector_id: vectorId
-    });
-    
-    console.log(`Vector stored in FAISS successfully for ${fileName}`);
-    console.log('Stored vector:', vector[0])
-    return metadata[metadata.length - 1];
+    metadata.push({ userId, data: extractedData, vector_id: vectorId });
+
+    console.log(`Vector stored in FAISS successfully for user ${userId}`);
+
 }
 
 app.post('/upload', upload.single('resume'), async (req, res) => {
-    console.log("hello")
     try {
         const extractedText = await extractTextFromPDF(req.file.path);
-        console.log(extractedText);
-        const prompt = `Extract the name,education, skills, projects, work experience and organization from the following text into a JSON format. Skills should be a string array. Only include technical skills related to programming languages, frameworks, and databases. Do not include achievements, or other skills. For projects, only include the name and description. Do not include the tech stack within the project object. organization means only companies not the universities or college,schools.The text is: ${extractedText}`;
+        const prompt = extract_prompt + extractedText;
+        
         const response = await model.generateContent(prompt);
         let result = response.response.text();
 
         if (result.startsWith("```json")) {
-            result = result.substring(7); // Remove "```json"
-          }
-          if (result.endsWith("```")) {
-            result = result.slice(0, -3); // Remove "```"
-          }
-        
-          // Remove leading/trailing whitespace and newlines
-          result = result.trim();
-        
-        console.log("Result",result);
-        res.json({ message: 'Resume data extracted and stored successfully!', data: JSON.parse(result) });
+            result = result.substring(7);
+        }
+        if (result.endsWith("```")) {
+            result = result.slice(0, -3);
+        }
+        result = result.trim();
 
+        const parsedData = JSON.parse(result);
+        console.log(parsedData);
+        await storeEmbedding(parsedData, req.body.userId);
+
+        res.json({ message: 'Resume data extracted and stored successfully!', data: parsedData });
+    } catch (error) {
+        res.status(500).json({ error: error.message , data: "hello" });
+    }
+});
+
+function getStoredEmbeddings() {
+    return metadata.map((item) => {
+        const vector = new Float32Array(768);
+        faissIndex.reconstruct(item.vector_id, vector);
+        return {
+            ...item,
+            vector: Array.from(vector)
+        };
+    });
+}
+
+app.get('/embeddings', (req, res) => {
+    try {
+        const embeddings = getStoredEmbeddings();
+        res.json({ embeddings });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
+});
+
+app.listen(PORT, () => {
+    console.log(`Server is running on http://localhost:${PORT}`);
 });
