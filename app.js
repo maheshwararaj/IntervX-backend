@@ -86,6 +86,7 @@ app.post('/upload', upload.single('resume'), async (req, res) => {
     try {
         const extractedText = await extractTextFromPDF(req.file.path);
         const prompt = extract_prompt + extractedText;
+        console.log(extractedText);
         
         const response = await model.generateContent(prompt);
         let result = response.response.text();
